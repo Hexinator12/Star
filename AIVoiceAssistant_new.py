@@ -321,14 +321,21 @@ Eligibility: {program.get('eligibility_summary', 'N/A')}"""
                 except Exception as e:
                     print(f"Error processing program {program.get('id', 'unknown')}: {e}")
             
-            # Process other sections (courses, faculty, etc.)
+            # Process other sections (courses, faculty, fees, etc.)
             sections = [
                 ('courses', 'course'),
                 ('faculty', 'faculty'),
                 ('admissions', 'admission'),
+                ('fees', 'fee'),
                 ('scholarships', 'scholarship'),
+                ('faqs', 'faq'),
+                ('placements', 'placement'),
+                ('hostel', 'hostel'),
+                ('contacts', 'contact'),
                 ('events', 'event'),
-                ('announcements', 'announcement')
+                ('policies', 'policy'),
+                ('announcements', 'announcement'),
+                ('qa_pairs', 'qa_pair')
             ]
             
             # Process each section

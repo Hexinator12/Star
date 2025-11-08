@@ -13,6 +13,13 @@ Usage:
     --force: Force recreate collection even if it exists
 """
 
+import sys
+import io
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 import json
 import os
 import argparse
@@ -144,9 +151,16 @@ Eligibility: {program.get('eligibility_summary', 'N/A')}"""
                 ('courses', 'course'),
                 ('faculty', 'faculty'),
                 ('admissions', 'admission'),
+                ('fees', 'fee'),
                 ('scholarships', 'scholarship'),
+                ('faqs', 'faq'),
+                ('placements', 'placement'),
+                ('hostel', 'hostel'),
+                ('contacts', 'contact'),
                 ('events', 'event'),
-                ('announcements', 'announcement')
+                ('policies', 'policy'),
+                ('announcements', 'announcement'),
+                ('qa_pairs', 'qa_pair')
             ]
             
             for section_name, doc_type in sections:
