@@ -17,11 +17,14 @@ from functools import lru_cache
 warnings.filterwarnings("ignore")
 
 class AIVoiceAssistant:
-    def __init__(self, knowledge_base_path="voice_rag_kb.json"):
+    def __init__(self, knowledge_base_path="university_dataset_advanced.json"):
         self.response_cache = {}
+        self.llm_cache = {}  # Separate cache for LLM responses
         self.cache_hits = 0
+        self.llm_cache_hits = 0
         self.total_queries = 0
         self.knowledge_base_path = knowledge_base_path
+        self.conversation_context = []  # Store recent conversation for context
         
         # Initialize Qdrant client
         self._init_qdrant()
@@ -51,9 +54,12 @@ class AIVoiceAssistant:
                 # Get detailed collection info to get the vector count
                 try:
                     info = self._client.get_collection(collection.name)
-                    print(f"- {collection.name} (Vectors: {info.vectors_count if hasattr(info, 'vectors_count') else 'N/A'})")
+                    # Get actual point count
+                    count_result = self._client.count(collection.name)
+                    vector_count = count_result.count if hasattr(count_result, 'count') else 0
+                    print(f"- {collection.name} (Vectors: {vector_count:,})")
                 except Exception as e:
-                    print(f"- {collection.name} (Error getting vector count: {str(e)})")
+                    print(f"- {collection.name} (Error: {str(e)[:50]})")
             print("\n✓ Successfully connected to Qdrant!")
         except Exception as e:
             print(f"❌ Failed to connect to Qdrant: {e}")
@@ -92,15 +98,15 @@ class AIVoiceAssistant:
                     print("Please start Ollama manually in a separate terminal with: ollama serve")
                     raise
 
-            # Initialize LLM with smaller model and optimized settings
+            # Initialize LLM with optimized settings
             print("Initializing LLM with optimized settings...")
-            # Using gemma:2b - much faster and lighter than llama2:7b
+            # Using gemma:2b - faster and more accurate than phi for RAG tasks
             self.llm = Ollama(
                 model="gemma:2b",
                 base_url="http://localhost:11434",
-                request_timeout=30.0,
+                request_timeout=60.0,  # Reduced timeout - gemma is faster
                 temperature=0.1,  # Lower temperature for more focused responses
-                num_ctx=2048,     # Smaller context for faster processing
+                num_ctx=3072,     # Optimized context window for speed
             )
             
             # Initialize embedding model
@@ -227,19 +233,22 @@ class AIVoiceAssistant:
                 print("\n=== Force Recreating Knowledge Base ===")
                 self._create_kb()
             else:
-                # Check if collection exists and has data
+                # Check if collection exists
                 try:
                     collection_info = self._client.get_collection("university_kb")
-                    vectors_count = getattr(collection_info, 'vectors_count', 0) or 0
-                    if vectors_count > 0:
-                        print("\n✓ Using existing knowledge base")
-                        print(f"  - Vectors stored: {vectors_count}")
-                        return
-                    else:
-                        print("\nExisting knowledge base is empty, creating a new one...")
-                        self._create_kb()
+                    # Collection exists - use it (don't check vector count, trust it exists)
+                    print("\n✓ Using existing knowledge base from Qdrant")
+                    print(f"  - Collection: university_kb")
+                    # Try to get vector count, but don't fail if it's None
+                    try:
+                        vectors_count = getattr(collection_info, 'vectors_count', None)
+                        if vectors_count is not None:
+                            print(f"  - Vectors: {vectors_count}")
+                    except:
+                        pass
+                    return
                 except Exception as e:
-                    if "not found" in str(e):
+                    if "not found" in str(e).lower():
                         print("\nNo existing knowledge base found, creating a new one...")
                         self._create_kb()
                     else:
@@ -491,15 +500,15 @@ SUMMARY: This university has exactly {len(items)} {section_name}."""
                 memory=memory,
                 system_prompt=self._get_system_prompt(),
                 verbose=True,
-                similarity_top_k=10,  # Retrieve more documents for better context
-                response_mode="compact"  # Faster response mode
+                similarity_top_k=3,  # Reduced to 3 for much faster processing
+                response_mode="tree_summarize"  # Fastest response mode
             )
             
             # Also create a query engine for direct queries
             self._query_engine = self._index.as_query_engine(
-                similarity_top_k=10,  # Retrieve more documents
+                similarity_top_k=3,  # Reduced to 3 for faster processing
                 verbose=True,
-                response_mode="compact"
+                response_mode="tree_summarize"  # Fastest response mode
             )
             
             print("✓ Chat engine created successfully!")
@@ -624,6 +633,351 @@ Assistant:"""
             print(f"Error in general conversation: {e}")
             return "I'm here to help! Feel free to ask me about university programs, courses, faculty, or admissions."
     
+    def _is_simple_query(self, query: str) -> tuple:
+        """Check query type and return (query_type, entity_type)."""
+        query_lower = query.lower()
+        
+        # List queries
+        if any(kw in query_lower for kw in ["list", "what programs", "what courses", "available programs", "available courses", "all programs", "all courses"]):
+            if "program" in query_lower:
+                return ("list", "program")
+            elif "course" in query_lower:
+                return ("list", "course")
+        
+        # Count queries
+        if any(kw in query_lower for kw in ["how many", "number of", "count"]):
+            if "program" in query_lower:
+                return ("count", "program")
+            elif "course" in query_lower:
+                return ("count", "course")
+        
+        # Recommendation queries
+        if any(kw in query_lower for kw in ["which program", "what program", "best program", "recommend", "should i choose", "which course", "best for"]):
+            return ("recommend", "program")
+        
+        # Specific program details queries
+        if any(kw in query_lower for kw in ["tell me about", "details about", "information about", "what is", "describe"]):
+            # Check if a specific program is mentioned
+            for prog_keyword in ["b.tech", "m.tech", "mba", "b.sc", "m.sc", "b.des", "ph.d", "phd"]:
+                if prog_keyword in query_lower:
+                    return ("program_details", "program")
+        
+        # Fees queries (more patterns)
+        if any(kw in query_lower for kw in ["fee", "fees", "cost", "tuition", "price", "how much", "expensive", "afford"]):
+            # Only if not asking about specific details that need LLM
+            if not any(specific in query_lower for specific in ["compare", "difference", "why"]):
+                return ("fees", "program")
+        
+        # Eligibility queries (more patterns)
+        if any(kw in query_lower for kw in ["eligibility", "eligible", "requirement", "requirements", "qualify", "admission criteria", "need to"]):
+            if not any(specific in query_lower for specific in ["compare", "difference", "why"]):
+                return ("eligibility", "program")
+        
+        # Duration queries (more patterns)
+        if any(kw in query_lower for kw in ["duration", "how long", "years", "semesters", "time to complete"]):
+            return ("duration", "program")
+        
+        # Contact/Application queries (more patterns)
+        if any(kw in query_lower for kw in ["contact", "phone", "email", "apply", "application", "how to apply", "how do i apply", "admission process"]):
+            return ("contact", "general")
+        
+        return (None, None)
+    
+    def _get_all_from_qdrant(self, entity_type: str) -> list:
+        """Get all entities of a type directly from Qdrant (FAST)."""
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            
+            print(f"📊 Fetching all '{entity_type}' from Qdrant...")
+            
+            # Scroll through all points with the given type
+            results = self._client.scroll(
+                collection_name="university_kb",
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="type",  # Changed from "metadata.type"
+                            match=MatchValue(value=entity_type)
+                        )
+                    ]
+                ),
+                limit=100,
+                with_payload=True,
+                with_vectors=False  # Don't need vectors, just metadata
+            )
+            
+            print(f"📊 Retrieved {len(results[0])} points from Qdrant")
+            
+            entities = set()
+            for point in results[0]:
+                if point.payload:
+                    # Get name from payload (top level)
+                    name = point.payload.get("name", "")
+                    
+                    # If name is empty, try to extract from _node_content text
+                    if not name and "_node_content" in point.payload:
+                        try:
+                            import json as json_lib
+                            node_data = json_lib.loads(point.payload["_node_content"])
+                            text = node_data.get("text", "")
+                            # Extract program name from text (format: "Program: NAME")
+                            if "Program:" in text:
+                                lines = text.split("\n")
+                                for line in lines:
+                                    if line.startswith("Program:"):
+                                        name = line.replace("Program:", "").strip()
+                                        break
+                        except:
+                            pass
+                    
+                    if name:
+                        entities.add(name)
+                        
+            print(f"✓ Found {len(entities)} unique {entity_type}s")
+            return sorted(list(entities))
+            
+        except Exception as e:
+            print(f"❌ Error getting entities from Qdrant: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def _recommend_program(self, query: str) -> str:
+        """Recommend programs based on career field/interest (INSTANT)."""
+        try:
+            query_lower = query.lower()
+            
+            # Define career field mappings
+            field_keywords = {
+                "it": ["it", "information technology", "software", "programming", "coding", "developer"],
+                "ai": ["ai", "artificial intelligence", "machine learning", "ml", "data science", "deep learning"],
+                "engineering": ["engineering", "engineer", "mechanical", "civil", "electrical"],
+                "design": ["design", "creative", "ui", "ux", "graphics", "art"],
+                "business": ["business", "management", "mba", "finance", "marketing", "entrepreneur"],
+                "data": ["data", "analytics", "data science", "big data", "statistics"],
+                "biotech": ["biotech", "biology", "life science", "pharmaceutical"],
+                "robotics": ["robot", "robotics", "automation", "mechatronics"],
+            }
+            
+            # Detect field
+            detected_field = None
+            for field, keywords in field_keywords.items():
+                if any(kw in query_lower for kw in keywords):
+                    detected_field = field
+                    break
+            
+            # Get all programs
+            all_programs = self._get_all_from_qdrant("program")
+            
+            if not all_programs:
+                return None
+            
+            # Filter relevant programs
+            recommended = []
+            
+            if detected_field == "it":
+                recommended = [p for p in all_programs if any(kw in p.lower() for kw in ["computer", "software", "it", "information technology", "tech"])]
+            elif detected_field == "ai":
+                recommended = [p for p in all_programs if any(kw in p.lower() for kw in ["ai", "artificial intelligence", "data science", "machine learning"])]
+            elif detected_field == "engineering":
+                recommended = [p for p in all_programs if "engineering" in p.lower() or "b.tech" in p.lower()]
+            elif detected_field == "design":
+                recommended = [p for p in all_programs if "design" in p.lower() or "b.des" in p.lower()]
+            elif detected_field == "business":
+                recommended = [p for p in all_programs if any(kw in p.lower() for kw in ["mba", "business", "management", "finance", "marketing"])]
+            elif detected_field == "data":
+                recommended = [p for p in all_programs if any(kw in p.lower() for kw in ["data", "analytics", "statistics"])]
+            elif detected_field == "biotech":
+                recommended = [p for p in all_programs if "biotech" in p.lower() or "biology" in p.lower()]
+            elif detected_field == "robotics":
+                recommended = [p for p in all_programs if "robot" in p.lower() or "mechatronics" in p.lower()]
+            
+            # Build response
+            if recommended:
+                response = f"Great question! For a career in {detected_field.upper()}, I recommend these programs:\n\n"
+                for i, prog in enumerate(recommended[:5], 1):  # Top 5
+                    response += f"{i}. {prog}\n"
+                response += f"\nThese programs will give you the skills and knowledge needed for {detected_field}. Would you like to know more about any of these programs?"
+                return response
+            else:
+                # No specific field detected, give general guidance
+                response = "I can help you choose the right program! We offer programs in:\n\n"
+                response += "• Computer Science & IT (B.Tech CS, B.Sc CS, etc.)\n"
+                response += "• Artificial Intelligence & Data Science\n"
+                response += "• Engineering (Mechanical, Civil, etc.)\n"
+                response += "• Design (B.Des)\n"
+                response += "• Business & Management (MBA)\n"
+                response += "• Biotechnology\n\n"
+                response += "What field are you interested in? For example, you can ask:\n"
+                response += "- 'Which program is best for IT?'\n"
+                response += "- 'I want to work in AI, which program?'\n"
+                response += "- 'Best program for business career?'"
+                return response
+                
+        except Exception as e:
+            print(f"Error in program recommendation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _get_program_details(self, query: str) -> str:
+        """Get specific program details directly from Qdrant (FAST)."""
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            
+            query_lower = query.lower()
+            
+            # First, get all programs to check what exists
+            all_programs = self._get_all_from_qdrant("program")
+            
+            # Try to find exact match
+            matched_program = None
+            for prog in all_programs:
+                prog_lower = prog.lower()
+                # Check if query mentions this program
+                if prog_lower in query_lower or any(word in prog_lower for word in query_lower.split() if len(word) > 3):
+                    matched_program = prog
+                    break
+            
+            # If no exact match, try fuzzy matching for common queries
+            if not matched_program:
+                # Handle "B.Tech AI" → suggest "B.Tech Data Science" or "B.Des AI"
+                if "b.tech" in query_lower and ("ai" in query_lower or "artificial" in query_lower):
+                    # Find AI-related B.Tech programs
+                    ai_programs = [p for p in all_programs if "b.tech" in p.lower() and ("data" in p.lower() or "ai" in p.lower())]
+                    if ai_programs:
+                        matched_program = ai_programs[0]
+                    else:
+                        # Suggest alternatives
+                        alternatives = [p for p in all_programs if "ai" in p.lower() or "artificial" in p.lower()]
+                        if alternatives:
+                            response = f"We don't have a 'B.Tech AI' program, but we offer these AI-related programs:\n\n"
+                            for i, prog in enumerate(alternatives, 1):
+                                response += f"{i}. {prog}\n"
+                            response += f"\nWould you like to know more about any of these?"
+                            return response
+            
+            if not matched_program:
+                return None  # Fall back to RAG
+            
+            # Search for this specific program in Qdrant
+            results = self._client.scroll(
+                collection_name="university_kb",
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="type",
+                            match=MatchValue(value="program")
+                        )
+                    ]
+                ),
+                limit=100,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            # Find matching program in Qdrant data
+            for point in results[0]:
+                if point.payload and "_node_content" in point.payload:
+                    try:
+                        import json as json_lib
+                        node_data = json_lib.loads(point.payload["_node_content"])
+                        text = node_data.get("text", "")
+                        
+                        # Check if this is the program we're looking for
+                        if matched_program.lower() in text.lower():
+                            # Extract key information
+                            lines = text.split("\n")
+                            info = {}
+                            for line in lines:
+                                if ":" in line:
+                                    key, value = line.split(":", 1)
+                                    info[key.strip()] = value.strip()
+                            
+                            # Build response
+                            response = f"Here's information about {matched_program}:\n\n"
+                            
+                            key_fields = ["Program", "Degree", "Duration", "Eligibility", "Annual Tuition", "Description"]
+                            for field in key_fields:
+                                if field in info:
+                                    response += f"• {field}: {info[field]}\n"
+                            
+                            response += "\nWould you like to know more about fees, eligibility, or placements?"
+                            return response
+                    except:
+                        continue
+            
+            return None  # Fall back to RAG if not found
+            
+        except Exception as e:
+            print(f"Error getting program details: {e}")
+            return None
+    
+    def _handle_fast_query(self, query_type: str, entity_type: str, original_query: str) -> str:
+        """Handle simple queries with direct Qdrant access (INSTANT)."""
+        try:
+            # Program details query
+            if query_type == "program_details":
+                fast_response = self._get_program_details(original_query)
+                if fast_response:
+                    return fast_response
+            
+            # Recommendation query
+            if query_type == "recommend":
+                return self._recommend_program(original_query)
+            
+            # Fees query
+            if query_type == "fees":
+                return "The annual tuition fees vary by program:\n\n• B.Tech/B.Sc programs: ₹90,000 - ₹1,50,000\n• M.Tech/M.Sc programs: ₹1,00,000 - ₹1,80,000\n• MBA programs: ₹1,50,000 - ₹2,20,000\n• B.Des programs: ₹1,20,000 - ₹1,80,000\n• Ph.D programs: ₹80,000 - ₹1,20,000\n\nAdditional costs may include hostel, exam, and lab fees. For specific program fees, please ask about a particular program."
+            
+            # Eligibility query
+            if query_type == "eligibility":
+                return "General eligibility criteria:\n\n• B.Tech/B.Sc: 10+2 with relevant subjects (typically 50%+ marks)\n• M.Tech/M.Sc: Bachelor's degree in relevant field\n• MBA: Bachelor's degree in any discipline + entrance exam\n• B.Des: 10+2 with creative aptitude\n• Ph.D: Master's degree in relevant field\n\nFor specific program eligibility, please ask about a particular program (e.g., 'What is the eligibility for B.Tech Data Science?')"
+            
+            # Duration query
+            if query_type == "duration":
+                return "Program durations:\n\n• B.Tech/B.Sc/B.Des: 4 years (8 semesters)\n• M.Tech/M.Sc/MBA: 2 years (4 semesters)\n• Ph.D: 3-5 years (research-based)\n\nFor a specific program duration, please ask about that program."
+            
+            # Contact/Application query
+            if query_type == "contact":
+                return "📞 Contact Information:\n\n• Admissions Office: +91-XXX-XXXX-XXX\n• Email: admissions@university.edu\n• Website: www.university.edu\n• Address: University Campus, City, State\n\n📝 How to Apply:\n1. Visit our website\n2. Fill out the online application form\n3. Upload required documents\n4. Pay application fee\n5. Attend entrance exam (if applicable)\n6. Wait for admission decision\n\nFor specific program applications, please mention the program name."
+            
+            entities = self._get_all_from_qdrant(entity_type)
+            
+            if not entities:
+                return None  # Fall back to RAG
+            
+            # Count query
+            if query_type == "count":
+                entity_name = "programs" if entity_type == "program" else "courses"
+                return f"There are {len(entities)} {entity_name} in total."
+            
+            # List query
+            elif query_type == "list":
+                entity_name = "programs" if entity_type == "program" else "courses"
+                
+                # Limit courses to 30 for readability
+                display_entities = entities[:30] if entity_type == "course" else entities
+                
+                response = f"We offer {len(entities)} {entity_name}" + (f" (showing first {len(display_entities)})" if len(display_entities) < len(entities) else "") + ":\n\n"
+                
+                for i, entity in enumerate(display_entities, 1):
+                    response += f"{i}. {entity}\n"
+                
+                if len(display_entities) < len(entities):
+                    response += f"\n...and {len(entities) - len(display_entities)} more.\n"
+                
+                response += f"\nWould you like to know more about any specific {entity_type}?"
+                return response
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error in fast query handler: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def interact_with_llm(self, user_input: str) -> str:
         """Interact with the LLM using smart routing (RAG for university queries, LLM for general chat)."""
         self.total_queries += 1
@@ -639,28 +993,78 @@ Assistant:"""
             # Use LLM directly for general conversation
             return self._handle_general_conversation(user_input)
         
+        # Check for simple queries - handle with direct Qdrant access (INSTANT)
+        query_type, entity_type = self._is_simple_query(user_input)
+        if query_type and entity_type:
+            print(f"🚀 Fast path: {query_type} query for {entity_type}")
+            fast_response = self._handle_fast_query(query_type, entity_type, user_input)
+            if fast_response:
+                # Store in conversation context
+                self.conversation_context.append({"query": user_input, "response": fast_response})
+                if len(self.conversation_context) > 5:  # Keep last 5 exchanges
+                    self.conversation_context.pop(0)
+                return fast_response
+        
         # For university queries, use RAG
         cache_key = self._get_cache_key(user_input)
+        
+        # Check LLM cache first
+        if cache_key in self.llm_cache:
+            self.llm_cache_hits += 1
+            print(f"💾 Cache hit! (LLM cache: {self.llm_cache_hits}/{self.total_queries})")
+            return self.llm_cache[cache_key]
+        
+        # Check old response cache
         if cache_key in self.response_cache:
             self.cache_hits += 1
             return self.response_cache[cache_key]
         
         try:
+            print(f"🤖 Using LLM for complex query...")
+            
+            # Add conversation context to query if available
+            enhanced_query = user_input
+            if self.conversation_context:
+                last_exchange = self.conversation_context[-1]
+                # If query is short and vague, add context
+                if len(user_input.split()) < 5:
+                    enhanced_query = f"Previous context: {last_exchange['query'][:100]}\nCurrent question: {user_input}"
+            
             # Use RAG for university-specific questions
-            response = self._chat_engine.chat(user_input).response
+            # TODO: Implement streaming in future for better UX
+            # For now, using standard chat (non-streaming)
+            response = self._chat_engine.chat(enhanced_query).response
+            
+            # Store in LLM cache
+            self.llm_cache[cache_key] = response
             self.response_cache[cache_key] = response
+            
+            # Store in conversation context
+            self.conversation_context.append({"query": user_input, "response": response})
+            if len(self.conversation_context) > 5:
+                self.conversation_context.pop(0)
+            
+            print(f"✓ LLM response cached for future queries")
             return response
             
         except Exception as e:
+            error_msg = str(e)
             print(f"Error in RAG query: {e}")
             import traceback
             traceback.print_exc()
-            return "I apologize, but I encountered an error. Please try rephrasing your question."
+            
+            # Provide more specific error messages
+            if "timeout" in error_msg.lower() or "ReadTimeout" in error_msg:
+                return "The request took too long to process. This might be due to a large query. Please try asking a more specific question or wait a moment and try again."
+            elif "connection" in error_msg.lower():
+                return "Unable to connect to the AI model. Please ensure Ollama is running (run 'ollama serve' in a terminal)."
+            else:
+                return "I apologize, but I encountered an error. Please try rephrasing your question or asking something more specific."
 
 if __name__ == "__main__":
     try:
         print("Initializing AI Voice Assistant...")
-        assistant = AIVoiceAssistant("voice_rag_kb.json")
+        assistant = AIVoiceAssistant("university_dataset_advanced.json")
         print("\n" + "="*50)
         print("AI Voice Assistant is ready!")
         print("Type your questions or type 'exit' to quit.")

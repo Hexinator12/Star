@@ -132,17 +132,59 @@ SUMMARY: This university has exactly {len(programs)} academic programs."""
                 
                 # Individual program documents
                 for program in programs:
-                    text = f"""Program: {program.get('name', 'N/A')}
-Duration: {program.get('duration', 'N/A')}
-Degree: {program.get('degree', 'N/A')}
-Description: {program.get('description', 'N/A')}
-Eligibility: {program.get('eligibility_summary', 'N/A')}"""
+                    # Build rich text with all available information
+                    text_parts = [
+                        f"Program: {program.get('name', 'N/A')}",
+                        f"Full Name: {program.get('full_name', program.get('name', 'N/A'))}",
+                        f"Duration: {program.get('duration', 'N/A')}",
+                        f"Degree: {program.get('degree', 'N/A')}",
+                        f"Description: {program.get('description', 'N/A')}",
+                        f"Detailed Description: {program.get('detailed_description', 'N/A')}"
+                    ]
+                    
+                    # Add eligibility
+                    eligibility = program.get('eligibility', {})
+                    if isinstance(eligibility, dict):
+                        text_parts.append(f"Eligibility: {eligibility.get('summary', 'N/A')}")
+                    else:
+                        text_parts.append(f"Eligibility: {program.get('eligibility_summary', 'N/A')}")
+                    
+                    # Add curriculum highlights
+                    if program.get('curriculum_highlights'):
+                        text_parts.append(f"Curriculum: {', '.join(program['curriculum_highlights'])}")
+                    
+                    # Add career opportunities
+                    if program.get('career_opportunities'):
+                        text_parts.append(f"Career Opportunities: {', '.join(program['career_opportunities'])}")
+                    
+                    # Add fees
+                    fees = program.get('fees', {})
+                    if fees:
+                        text_parts.append(f"Annual Tuition: {fees.get('annual_tuition', 'N/A')}")
+                        text_parts.append(f"Total Cost: {fees.get('total_program_cost', 'N/A')}")
+                    
+                    # Add top recruiters
+                    if program.get('top_recruiters'):
+                        text_parts.append(f"Top Recruiters: {', '.join(program['top_recruiters'][:5])}")
+                    
+                    # Add common questions for better semantic matching
+                    if program.get('common_questions'):
+                        text_parts.append(f"Common Questions: {' | '.join(program['common_questions'])}")
+                    
+                    # Add search keywords
+                    if program.get('search_keywords'):
+                        text_parts.append(f"Keywords: {', '.join(program['search_keywords'])}")
+                    
+                    text = '\n'.join(text_parts)
+                    
                     documents.append(Document(
                         text=text,
                         metadata={
                             "type": "program",
                             "id": program.get('id', ''),
-                            "name": program.get('name', '')
+                            "name": program.get('name', ''),
+                            "degree": program.get('degree', ''),
+                            "tags": ','.join(program.get('tags', []))
                         }
                     ))
             
@@ -200,18 +242,46 @@ SUMMARY: This university has exactly {len(items)} {section_name}."""
                 
                 # Individual documents
                 for item in items:
-                    text_lines = [f"{k.replace('_', ' ').title()}: {v}" 
-                                for k, v in item.items() 
-                                if v and not k.startswith('_')]
-                    
-                    documents.append(Document(
-                        text='\n'.join(text_lines),
-                        metadata={
-                            "type": doc_type,
-                            "id": str(item.get('id', '')),
-                            "name": str(item.get('name', item.get('title', '')))[:100]
-                        }
-                    ))
+                    # Special handling for FAQs with question variations
+                    if section_name == 'faqs':
+                        text_parts = [f"Question: {item.get('question', 'N/A')}"]
+                        
+                        # Add question variations for better semantic matching
+                        if item.get('question_variations'):
+                            variations = item['question_variations']
+                            text_parts.append(f"Alternative Questions: {' | '.join(variations)}")
+                        
+                        text_parts.append(f"Answer: {item.get('answer', 'N/A')}")
+                        
+                        # Add related topics
+                        if item.get('related_topics'):
+                            text_parts.append(f"Related Topics: {', '.join(item['related_topics'])}")
+                        
+                        text = '\n'.join(text_parts)
+                        
+                        documents.append(Document(
+                            text=text,
+                            metadata={
+                                "type": doc_type,
+                                "id": str(item.get('id', '')),
+                                "question": str(item.get('question', ''))[:200],
+                                "tags": ','.join(item.get('tags', []))
+                            }
+                        ))
+                    else:
+                        # Generic handling for other sections
+                        text_lines = [f"{k.replace('_', ' ').title()}: {v}" 
+                                    for k, v in item.items() 
+                                    if v and not k.startswith('_') and isinstance(v, (str, int, float))]
+                        
+                        documents.append(Document(
+                            text='\n'.join(text_lines),
+                            metadata={
+                                "type": doc_type,
+                                "id": str(item.get('id', '')),
+                                "name": str(item.get('name', item.get('title', '')))[:100]
+                            }
+                        ))
             
             print(f"\n✓ Knowledge base loaded successfully!")
             print(f"\nData Statistics:")
@@ -371,8 +441,8 @@ def main():
     parser.add_argument(
         '--kb-path',
         type=str,
-        default='voice_rag_kb.json',
-        help='Path to knowledge base JSON file (default: voice_rag_kb.json)'
+        default='university_dataset_advanced.json',
+        help='Path to knowledge base JSON file (default: university_dataset_advanced.json)'
     )
     parser.add_argument(
         '--collection',

@@ -70,7 +70,7 @@ async def startup_event():
     global assistant
     try:
         print("🚀 Initializing AI Voice Assistant...")
-        assistant = AIVoiceAssistant("voice_rag_kb.json")
+        assistant = AIVoiceAssistant("university_dataset_advanced.json")
         print("✅ AI Voice Assistant initialized successfully!")
     except Exception as e:
         print(f"❌ Failed to initialize assistant: {e}")
