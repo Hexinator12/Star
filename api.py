@@ -3,12 +3,23 @@ FastAPI Backend for RAG AI Voice Assistant
 Provides REST API endpoints to interact with the assistant from a web frontend.
 """
 
+import os
+# Disable CUDA warnings and optimize CPU usage
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
+os.environ['KMP_AFFINITY'] = 'noverbose'
+os.environ['OMP_NUM_THREADS'] = '8'  # Adjust based on your CPU cores
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 import sys
 import io
 # Set UTF-8 encoding for Windows console
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# Suppress warnings after imports
+import warnings
+warnings.filterwarnings('ignore')
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

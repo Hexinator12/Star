@@ -1,30 +1,88 @@
+# Configure environment for optimal performance
+import os
+os.environ['OMP_NUM_THREADS'] = '8'  # Match your CPU core count
+os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Disable tokenizer parallelism
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
+os.environ['KMP_AFFINITY'] = 'noverbose'
+
+# Standard library imports
+import time
+import json
+import hashlib
+import re
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from functools import lru_cache
+from collections import defaultdict
+import numpy as np
+
+# Suppress warnings
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+@dataclass
+class CacheEntry:
+    response: Any
+    timestamp: float
+    ttl: int = 3600  # 1 hour default TTL
+
 from qdrant_client import QdrantClient, models
 from llama_index.llms.ollama import Ollama
 from llama_index.core import Document, Settings
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core import VectorStoreIndex
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-from llama_index.core import StorageContext
+from llama_index.core import StorageContext, QueryBundle
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from typing import Optional, List, Dict, Any
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import NodeWithScore, QueryType
+from llama_index.core.postprocessor import SentenceTransformerRerank
+from typing import Optional, List, Dict, Any, Tuple
 import json
 import os
 import warnings
 from hashlib import md5
 from functools import lru_cache
+import re
+from collections import defaultdict
+import numpy as np
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
 class AIVoiceAssistant:
     def __init__(self, knowledge_base_path="university_dataset_advanced.json"):
-        self.response_cache = {}
-        self.llm_cache = {}  # Separate cache for LLM responses
+        # Initialize caches with TTL support
+        self.response_cache: Dict[str, CacheEntry] = {}
+        self.llm_cache: Dict[str, CacheEntry] = {}
         self.cache_hits = 0
         self.llm_cache_hits = 0
         self.total_queries = 0
         self.knowledge_base_path = knowledge_base_path
-        self.conversation_context = []  # Store recent conversation for context
+        
+        # Initialize program cache
+        self._init_program_cache()
+        
+        # Enhanced conversation memory with optimized structure
+        self.conversation_history = []  # Complete conversation history
+        self.conversation_context = []  # Active context window (last 5 exchanges)
+        self.conversation_summary = ""  # Summary of the conversation
+        self.max_context_tokens = 2000  # Maximum tokens for conversation context
+        
+        # User preferences with optimized defaults
+        self.user_preferences = {
+            'preferred_programs': set(),
+            'interests': set(),
+            'preferred_response_style': 'concise',  # 'concise' or 'detailed'
+            'last_updated': time.time()
+        }
+        self.conversation_summary = ""  # Summary of the conversation so far
+        self.max_context_tokens = 2000  # Maximum tokens for conversation context
         
         # Initialize Qdrant client
         self._init_qdrant()
@@ -38,32 +96,116 @@ class AIVoiceAssistant:
         # Create chat engine
         self._create_chat_engine()
 
-    def _init_qdrant(self):
-        """Initialize Qdrant client with enhanced logging."""
+    def _is_ollama_running(self) -> bool:
+        """Check if Ollama server is running and accessible."""
+        import requests
         try:
-            print("\n=== Initializing Qdrant Client ===")
+            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+
+    def _init_models(self):
+        """Initialize LLM, embedding models, and re-ranker with better error handling and timeouts."""
+        try:
+            # Check if Ollama server is running
+            if not self._is_ollama_running():
+                print("Ollama server is not running. Please start it with: ollama serve")
+                print("Trying to start Ollama server...")
+                import subprocess
+                try:
+                    # Start Ollama in the background
+                    subprocess.Popen(
+                        ["ollama", "serve"], 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE
+                    )
+                    # Wait for server to start
+                    time.sleep(5)
+                except Exception as e:
+                    print(f"Failed to start Ollama server: {e}")
+                    print("Please start Ollama manually in a separate terminal with: ollama serve")
+                    raise
+
+            # Initialize LLM with optimized settings
+            print("Initializing LLM with optimized settings...")
+            self.llm = Ollama(
+                model="gemma:2b",
+                base_url="http://localhost:11434",
+                request_timeout=30.0,  # Reduced from 60s
+                temperature=0.2,  # Slightly higher for better creativity
+                num_ctx=2048,    # Reduced context window for faster processing
+                num_gpu_layers=0,  # Force CPU for consistent performance
+                num_thread=4,     # Match OMP_NUM_THREADS
+                repeat_last_n=64,  # Reduce memory usage
+                repeat_penalty=1.1,  # Slightly reduce repetition
+                top_k=40,        # Faster sampling
+                top_p=0.9,       # Smarter sampling
+            )
+            
+            # Initialize embedding model with optimized settings
+            print("Initializing Embedding Model with optimized settings...")
+            self.embeddings = HuggingFaceEmbedding(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                device="cpu",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={
+                    'batch_size': 32,
+                    'convert_to_numpy': True,
+                    'normalize_embeddings': True
+                }
+            )
+            
+            # Test the embedding model
+            test_embedding = self.embeddings.get_text_embedding("test")
+            print(f"✓ Embedding model initialized successfully (dim={len(test_embedding)})")
+            
+        except Exception as e:
+            print(f"❌ Error initializing models: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _init_qdrant(self):
+        """Initialize Qdrant client with optimized settings."""
+        try:
+            print("\n=== Initializing Qdrant Client with Optimized Settings ===")
+            
+            # First try to connect with default settings
             self._client = QdrantClient(
                 url="http://localhost:6333",
-                prefer_grpc=False,
-                timeout=10.0
+                prefer_grpc=False,  # HTTP is often faster for local development
+                timeout=10.0,       # Increased timeout for initial connection
+                api_key=None,       # No API key for local development
+                https=False         # Use HTTP for local development
             )
-            # Test the connection and list collections
-            collections = self._client.get_collections()
-            print("\n=== Qdrant Collections ===")
-            for collection in collections.collections:
-                # Get detailed collection info to get the vector count
-                try:
-                    info = self._client.get_collection(collection.name)
-                    # Get actual point count
-                    count_result = self._client.count(collection.name)
-                    vector_count = count_result.count if hasattr(count_result, 'count') else 0
-                    print(f"- {collection.name} (Vectors: {vector_count:,})")
-                except Exception as e:
-                    print(f"- {collection.name} (Error: {str(e)[:50]})")
-            print("\n✓ Successfully connected to Qdrant!")
+            
+            # Test the connection with a simple operation
+            try:
+                collections = self._client.get_collections()
+                print("\n=== Qdrant Collections ===")
+                for collection in collections.collections:
+                    try:
+                        info = self._client.get_collection(collection.name)
+                        count_result = self._client.count(collection.name)
+                        vector_count = count_result.count if hasattr(count_result, 'count') else 0
+                        print(f"- {collection.name} (Vectors: {vector_count:,})")
+                    except Exception as e:
+                        print(f"- {collection.name} (Error: {str(e)[:50]})")
+                
+                print("\n✓ Qdrant client initialized successfully")
+                return
+                
+            except Exception as e:
+                print(f"❌ Failed to connect to Qdrant: {e}")
+                print("\nTroubleshooting steps:")
+                print("1. Make sure Qdrant is running: docker run -p 6333:6333 qdrant/qdrant")
+                print("2. Check if port 6333 is available")
+                print("3. Verify Qdrant is accessible at http://localhost:6333")
+                raise
+            
         except Exception as e:
             print(f"❌ Failed to connect to Qdrant: {e}")
-            raise
             raise
 
     def _is_ollama_running(self) -> bool:
@@ -76,7 +218,7 @@ class AIVoiceAssistant:
             return False
 
     def _init_models(self):
-        """Initialize LLM and embedding models with better error handling and timeouts."""
+        """Initialize LLM, embedding models, and re-ranker with better error handling and timeouts."""
         try:
             # Check if Ollama server is running
             if not self._is_ollama_running():
@@ -109,9 +251,29 @@ class AIVoiceAssistant:
                 num_ctx=3072,     # Optimized context window for speed
             )
             
-            # Initialize embedding model
-            print("Initializing Embedding Model (BAAI/bge-small-en-v1.5)...")
-            self.embeddings = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            # Initialize embedding model with CPU
+            print("Initializing Embedding Model (BAAI/bge-small-en-v1.5) on CPU...")
+            try:
+                # Ensure no GPU is used
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+                
+                # Initialize with minimal configuration
+                self.embeddings = HuggingFaceEmbedding(
+                    model_name="sentence-transformers/all-MiniLM-L6-v2",  # More compatible model
+                    device="cpu"
+                )
+                # Test the embedding model
+                test_embedding = self.embeddings.get_text_embedding("test")
+                print(f"✓ Embedding model initialized successfully (dim={len(test_embedding)})")
+                
+            except Exception as e:
+                print(f"❌ Error initializing embedding model: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            
+            # Initialize re-ranker (will be loaded on first use)
+            self._reranker = None
             
             # Update settings
             Settings.llm = self.llm
@@ -473,15 +635,111 @@ SUMMARY: This university has exactly {len(items)} {section_name}."""
             traceback.print_exc()
             return []
 
-    def _create_chat_engine(self):
-        """Create the chat engine with memory."""
-        try:
-            print("\n=== Creating Chat Engine ===")
+    def _expand_query(self, query: str) -> Tuple[str, Dict[str, List[str]]]:
+        """Expand the query with synonyms and related terms using LLM."""
+        # Check cache first
+        cache_key = f"query_expand:{query.lower().strip()}"
+        if cache_key in self.llm_cache:
+            return self.llm_cache[cache_key]
             
-            # Create vector store (use default vector name to match collection config)
+        # Generate query variations using LLM
+        prompt = f"""Given the user query, generate 2-3 alternative phrasings or expansions that might help retrieve more relevant documents.
+        Focus on academic and university-related terminology.
+        
+        Query: {query}
+        
+        Respond in this exact format (no extra text):
+        - [Alternative 1]
+        - [Alternative 2]
+        - [Alternative 3]"""
+        
+        try:
+            response = self.llm.complete(prompt)
+            alternatives = [q.strip('- ').strip() for q in response.text.split('\n') if q.strip()]
+            
+            # Combine original query with alternatives
+            expanded_queries = [query] + alternatives
+            
+            # Extract key terms for BM25
+            terms = set()
+            for q in expanded_queries:
+                terms.update(re.findall(r'\b\w+\b', q.lower()))
+            
+            result = (" OR ".join(f'({q})' for q in expanded_queries), {"bm25_terms": list(terms)})
+            self.llm_cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            print(f"Warning: Query expansion failed: {e}")
+            return query, {"bm25_terms": re.findall(r'\b\w+\b', query.lower())}
+
+    def _rerank_documents(self, query: str, nodes: List[NodeWithScore]) -> List[NodeWithScore]:
+        """Re-rank retrieved documents using cross-encoder and diversity."""
+        if not nodes:
+            return nodes
+            
+        # Initialize re-ranker if not already done
+        if not hasattr(self, '_reranker'):
+            try:
+                # Initialize reranker with minimal configuration
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Ensure no GPU is used
+                from sentence_transformers import CrossEncoder
+                try:
+                    # Use a simpler model that's more likely to work
+                    cross_encoder = CrossEncoder('cross-encoder/ms-marco-TinyBERT-L-2-v2')
+                    self._reranker = SentenceTransformerRerank(
+                        model=cross_encoder,
+                        top_n=5
+                    )
+                except Exception as e:
+                    print(f"Warning: Could not initialize CrossEncoder: {e}")
+                    # Disable reranking if initialization fails
+                    self._reranker = None
+            except Exception as e:
+                print(f"Warning: Could not load re-ranker: {e}")
+                return nodes
+        
+        try:
+            # Convert nodes to format expected by re-ranker
+            query_bundle = QueryBundle(query_str=query)
+            
+            # Apply re-ranking
+            reranked_nodes = self._reranker.postprocess_nodes(
+                nodes,
+                query_bundle
+            )
+            
+            # Apply diversity: avoid very similar documents
+            unique_docs = []
+            seen_content = set()
+            
+            for node in reranked_nodes:
+                # Simple content-based deduplication
+                content_hash = md5(node.node.get_content().encode()).hexdigest()
+                if content_hash not in seen_content:
+                    seen_content.add(content_hash)
+                    unique_docs.append(node)
+                
+                if len(unique_docs) >= 5:  # Limit to top 5 diverse results
+                    break
+                    
+            return unique_docs
+            
+        except Exception as e:
+            print(f"Warning: Re-ranking failed: {e}")
+            return nodes[:5]  # Fallback to top 5
+
+    def _create_chat_engine(self):
+        """Create the chat engine with enhanced retrieval and re-ranking."""
+        try:
+            print("\n=== Creating Enhanced Chat Engine ===")
+            
+            # Create vector store with hybrid search support
             vector_store = QdrantVectorStore(
                 client=self._client,
-                collection_name="university_kb"
+                collection_name="university_kb",
+                enable_hybrid=True,  # Enable hybrid search (BM25 + vector)
+                batch_size=32
             )
             
             # Create storage context
@@ -493,49 +751,221 @@ SUMMARY: This university has exactly {len(items)} {section_name}."""
                 storage_context=storage_context
             )
             
-            # Create chat engine with memory
-            memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
-            self._chat_engine = self._index.as_chat_engine(
-                chat_mode="context",
+            # Create a custom retriever with enhanced settings
+            class EnhancedRetriever(VectorIndexRetriever):
+                def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+                    # Expand the query
+                    expanded_query, metadata = self._index._expand_query(query_bundle.query_str)
+                    
+                    # Perform hybrid search
+                    vector_retriever = VectorIndexRetriever(
+                        index=self._index,
+                        similarity_top_k=10,  # Retrieve more for re-ranking
+                        vector_store_query_mode="hybrid",
+                        alpha=0.7  # Weight for vector vs BM25 (0.7 = 70% vector, 30% BM25)
+                    )
+                    
+                    # Get initial results
+                    nodes = vector_retriever.retrieve(expanded_query)
+                    
+                    # Apply re-ranking
+                    return self._index._rerank_documents(query_bundle.query_str, nodes)
+            
+            # Create the enhanced retriever
+            retriever = EnhancedRetriever(
+                index=self._index,
+                similarity_top_k=5,  # Final number of results after re-ranking
+                vector_store_query_mode="hybrid",
+                alpha=0.7
+            )
+            
+            # Create chat engine with memory and enhanced retrieval
+            memory = ChatMemoryBuffer.from_defaults(token_limit=2000)  # Increased for better context
+            
+            self._chat_engine = RetrieverQueryEngine.from_args(
+                retriever=retriever,
+                llm=self.llm,
                 memory=memory,
                 system_prompt=self._get_system_prompt(),
                 verbose=True,
-                similarity_top_k=3,  # Reduced to 3 for much faster processing
-                response_mode="tree_summarize"  # Fastest response mode
+                response_mode="tree_summarize"
             )
             
             # Also create a query engine for direct queries
-            self._query_engine = self._index.as_query_engine(
-                similarity_top_k=3,  # Reduced to 3 for faster processing
+            self._query_engine = RetrieverQueryEngine.from_args(
+                retriever=retriever,
+                llm=self.llm,
+                system_prompt=self._get_system_prompt(),
                 verbose=True,
-                response_mode="tree_summarize"  # Fastest response mode
+                response_mode="tree_summarize"
             )
             
-            print("✓ Chat engine created successfully!")
+            # Add the retriever and re-ranker to the instance for later use
+            self.retriever = retriever
+            
+            print("✓ Enhanced chat engine created successfully!")
             
         except Exception as e:
-            print(f"❌ Error creating chat engine: {e}")
+            print(f"❌ Error creating enhanced chat engine: {e}")
             import traceback
             traceback.print_exc()
             raise
 
+    def _update_conversation_context(self, query: str, response: str) -> None:
+        """Update conversation context with the latest exchange."""
+        # Add to full history
+        self.conversation_history.append({
+            'query': query,
+            'response': response,
+            'timestamp': time.time()
+        })
+        
+        # Add to active context window
+        self.conversation_context.append({
+            'role': 'user',
+            'content': query
+        })
+        self.conversation_context.append({
+            'role': 'assistant',
+            'content': response
+        })
+        
+        # Update conversation summary periodically
+        if len(self.conversation_history) % 3 == 0:  # Update summary every 3 exchanges
+            self._update_conversation_summary()
+            
+        # Trim context if it's getting too long
+        self._trim_conversation_context()
+    
+    def _update_conversation_summary(self) -> None:
+        """Generate a summary of the conversation so far."""
+        if not self.conversation_history:
+            return
+            
+        # Use the last few exchanges to update the summary
+        recent_exchanges = '\n'.join(
+            f"User: {ex['query']}\nAssistant: {ex['response']}"
+            for ex in self.conversation_history[-3:]  # Last 3 exchanges
+        )
+        
+        prompt = f"""Summarize the key points from this conversation in 2-3 sentences.
+        Focus on user preferences, important details, and the main topics discussed.
+        
+        Conversation:
+        {recent_exchanges}
+        
+        Summary:"""
+        
+        try:
+            summary = self.llm.complete(prompt).text.strip()
+            self.conversation_summary = summary
+        except Exception as e:
+            print(f"Warning: Failed to update conversation summary: {e}")
+    
+    def _trim_conversation_context(self) -> None:
+        """Trim the conversation context to stay within token limits."""
+        # Simple token estimation (1 token ~= 4 chars in English)
+        def count_tokens(text):
+            return len(str(text).encode('utf-8')) // 4
+            
+        total_tokens = sum(count_tokens(msg['content']) for msg in self.conversation_context)
+        
+        # Remove oldest messages if over limit, but keep at least the last exchange
+        while total_tokens > self.max_context_tokens and len(self.conversation_context) > 2:
+            removed = self.conversation_context.pop(0)
+            total_tokens -= count_tokens(removed['content'])
+    
     def _get_system_prompt(self) -> str:
-        """Get the system prompt for the chat engine."""
-        return """You are a helpful university assistant. Answer questions based ONLY on the provided context.
+        """Get the system prompt for the chat engine with enhanced instructions."""
+        # Add conversation summary and preferences to the system prompt
+        context_parts = []
+        
+        if self.conversation_summary:
+            context_parts.append(f"CONVERSATION SUMMARY: {self.conversation_summary}")
+            
+        if self.user_preferences['preferred_programs']:
+            programs = ', '.join(sorted(self.user_preferences['preferred_programs']))
+            context_parts.append(f"USER'S PREFERRED PROGRAMS: {programs}")
+            
+        if self.user_preferences['interests']:
+            interests = ', '.join(sorted(self.user_preferences['interests']))
+            context_parts.append(f"USER'S INTERESTS: {interests}")
+        
+        context_str = '\n'.join(context_parts)
+        
+        return f"""You are an intelligent university assistant. Your role is to provide accurate, helpful, and context-aware responses to students and visitors.
+        
+{context_str}
 
-IMPORTANT RULES:
-1. Use ONLY the information from the context provided
-2. If asked about counts (how many programs, courses, etc.), count ALL items in the context
-3. Be concise and direct - avoid unnecessary elaboration
-4. If the context doesn't contain the answer, say "I don't have that information"
-5. When listing items, include ALL of them from the context, not just one example
+IMPORTANT CONTEXT: Use the above information to provide personalized responses.
 
-For counting questions: Count every single item mentioned in the context before answering.
-        """
+# CORE INSTRUCTIONS:
+1. Always be polite, professional, and student-focused in your responses.
+2. If you need clarification, ask specific follow-up questions to better understand the user's needs.
+3. When providing information, be as specific and detailed as possible while remaining concise.
+4. If you're unsure about something, it's okay to say so and guide the user to the right resource.
 
-    def _get_cache_key(self, text: str) -> str:
-        """Generate a cache key for the given text."""
-        return md5(text.strip().lower().encode('utf-8')).hexdigest()
+# HANDLING GENERAL QUERIES:
+- For broad questions (e.g., "Tell me about programs"), first ask clarifying questions to narrow down the scope.
+- When listing items, provide a clear structure and organize information logically.
+- If multiple programs/courses match the query, list the top 3 most relevant ones first, then mention there are more options available.
+
+# RESPONSE FORMATTING:
+- Use clear section headers when appropriate
+- Break down complex information into bullet points
+- Include relevant details like duration, fees, and requirements when discussing programs/courses
+- When providing step-by-step guidance, number the steps clearly
+
+# WHEN INFORMATION IS UNCLEAR:
+1. Acknowledge the user's question
+2. Explain what additional information you need
+3. Provide examples of specific questions that would help
+4. Offer to help with related information while waiting for clarification
+
+# EXAMPLE RESPONSES:
+For general queries: "I'd be happy to help! Could you please specify which type of program you're interested in? For example, are you looking for undergraduate, graduate, or professional programs?"
+
+For unclear requests: "I want to make sure I understand your question correctly. Could you tell me more about what specific information you're looking for? For example, are you asking about admission requirements, course content, or career prospects?"
+
+Remember: Always maintain a helpful and patient tone, even when the query is unclear or needs more context.
+"""
+
+    def _get_cache_key(self, text: str, use_semantic: bool = True) -> str:
+        """Generate a cache key for the given text, with option for semantic hashing."""
+        text = text.strip().lower()
+        if use_semantic and len(text.split()) > 3:  # Only use semantic for longer texts
+            # Simple semantic key - first and last few words + length
+            words = text.split()
+            semantic_key = f"{' '.join(words[:2])} {len(words)} {''.join(w[0] for w in words[1:-1])} {' '.join(words[-2:])}"
+            return hashlib.md5(semantic_key.encode('utf-8')).hexdigest()
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+        
+    def _get_cached_response(self, key: str, cache_type: str = 'llm') -> Optional[Any]:
+        """Get cached response if it exists and is not expired."""
+        cache = self.llm_cache if cache_type == 'llm' else self.response_cache
+        if key in cache:
+            entry = cache[key]
+            if time.time() - entry.timestamp < entry.ttl:
+                if cache_type == 'llm':
+                    self.llm_cache_hits += 1
+                else:
+                    self.cache_hits += 1
+                return entry.response
+            del cache[key]  # Remove expired entry
+        return None
+
+    def _cache_response(self, key: str, response: Any, ttl: int = 3600, cache_type: str = 'llm') -> None:
+        """Cache a response with TTL."""
+        cache = self.llm_cache if cache_type == 'llm' else self.response_cache
+        cache[key] = CacheEntry(
+            response=response,
+            timestamp=time.time(),
+            ttl=ttl
+        )
+        # Simple cache eviction if cache gets too large
+        if len(cache) > 1000:  # Keep last 1000 entries
+            oldest_key = min(cache.keys(), key=lambda k: cache[k].timestamp)
+            del cache[oldest_key]
 
     def _handle_fee_query(self, query: str) -> Optional[str]:
         """Handle fee-related queries with direct database lookup."""
@@ -579,59 +1009,263 @@ For more information, please contact the admissions office."""
             print(f"Error in _handle_fee_query: {e}")
             return None
 
-    def _classify_query_intent(self, user_input: str) -> str:
-        """Classify the user's query intent to route it appropriately."""
-        user_lower = user_input.lower().strip()
+    def _init_program_cache(self):
+        """Initialize the program cache for fast lookups."""
+        self._programs_cache = {
+            "m.tech in design": "M.Tech in Design (M.Tech, 2 years (4 semesters))",
+            "b.tech in biotechnology": "B.Tech in Biotechnology (B.Tech, 4 years (8 semesters))",
+            "ph.d in design": "Ph.D in Design (Ph.D, 3 years (6 semesters))",
+            "b.sc in civil engineering": "B.Sc in Civil Engineering (B.Sc, 4 years (8 semesters))",
+            "mba in data science": "MBA in Data Science (MBA, 2 years (4 semesters))",
+            "b.des in design": "B.Des in Design (B.Des, 4 years (8 semesters))",
+            "m.sc in entrepreneurship": "M.Sc in Entrepreneurship (M.Sc, 2 years (4 semesters))",
+            "mba in mechanical engineering": "MBA in Mechanical Engineering (MBA, 2 years (4 semesters))",
+            "ph.d in information security": "Ph.D in Information Security (Ph.D, 3 years (6 semesters))",
+            "m.tech in robotics": "M.Tech in Robotics (M.Tech, 2 years (4 semesters))",
+            "mca in biotechnology": "MCA in Biotechnology (MCA, 2 years (4 semesters))",
+            "b.tech in mechanical engineering": "B.Tech in Mechanical Engineering (B.Tech, 4 years (8 semesters))",
+            "ph.d in robotics": "Ph.D in Robotics (Ph.D, 3 years (6 semesters))",
+            "b.tech in robotics": "B.Tech in Robotics (B.Tech, 4 years (8 semesters))",
+            "mca in information security": "MCA in Information Security (MCA, 2 years (4 semesters))",
+            "m.tech in marketing": "M.Tech in Marketing (M.Tech, 2 years (4 semesters))",
+            "m.tech in civil engineering": "M.Tech in Civil Engineering (M.Tech, 2 years (4 semesters))",
+            "mba in finance": "MBA in Finance (MBA, 2 years (4 semesters))",
+            "b.des in artificial intelligence": "B.Des in Artificial Intelligence (B.Des, 4 years (8 semesters))"
+        }
+        self._programs_list = sorted(self._programs_cache.values())
+
+    def get_program_info(self, query: str) -> str:
+        """Get information about a specific program with exact and fuzzy matching."""
+        query = query.lower().strip()
         
-        # Check for greetings
-        greetings = ['hi', 'hello', 'hey', 'greetings', 'good morning', 'good afternoon', 'good evening', 'howdy']
-        if any(user_lower == g or user_lower.startswith(g + ' ') for g in greetings):
-            return "greeting"
+        # Define degree types for reference
+        degree_types = ['b.tech', 'm.tech', 'ph.d', 'b.des', 'mba', 'm.sc', 'mca', 'b.sc']
+        
+        # Try exact match first
+        for program_name, program_info in self._programs_cache.items():
+            # Check for exact program name match (case insensitive)
+            if query == program_name.lower():
+                return program_info
+                
+        # Extract degree type and program name from query
+        query_degree = next((d for d in degree_types if query.startswith(d)), None)
+        program_name_part = query.replace(query_degree, '').strip() if query_degree else query
+        
+        # Try matching with program name parts
+        best_match = None
+        best_score = 0
+        
+        for program_name, program_info in self._programs_cache.items():
+            # Skip if degree types don't match (if degree was specified in query)
+            if query_degree and not program_name.lower().startswith(query_degree):
+                continue
+                
+            # Calculate match score based on word overlap
+            program_words = set(program_name.lower().split())
+            query_words = set(query.split())
+            common_words = query_words.intersection(program_words)
+            
+            # Special handling for B.Tech in Robotics
+            if 'robotics' in query and 'b.tech' in program_name.lower() and 'robotics' in program_name.lower():
+                return program_info
+                
+            # Calculate score based on word matches
+            score = len(common_words)
+            
+            # Bonus for matching degree type
+            if query_degree and program_name.lower().startswith(query_degree):
+                score += 2
+                
+            # Update best match if this one scores higher
+            if score > best_score or (score == best_score and query_degree and program_name.lower().startswith(query_degree)):
+                best_score = score
+                best_match = program_info
+        
+        # Only return if we have a good match
+        if best_score >= 1:  # Reduced threshold to 1 to catch more potential matches
+            return best_match
+            
+        return None
+
+    def list_all_programs(self) -> list:
+        """Get a sorted list of all available programs."""
+        return self._programs_list
+
+    def _handle_program_query(self, query: str) -> str:
+        """Handle program-related queries with optimized response times."""
+        original_query = query
+        query = query.lower().strip()
+        
+        # Check for list all programs
+        if any(cmd in query for cmd in ["list", "all", "programs", "tell me about"]):
+            programs = self.list_all_programs()
+            return "Here are all available programs:\n\n" + "\n".join(f"- {p}" for p in programs)
+        
+        # Special case for B.Tech in Robotics
+        if 'robotics' in query and ('b.tech' in query or 'btech' in query):
+            program_info = self._programs_cache.get('b.tech in robotics')
+            if program_info:
+                program_name = program_info.split('(')[0].strip()
+                return f"""Here's information about {program_name}:
+                
+• Program: {program_name}
+• Degree: B.Tech
+• Duration: 4 years (8 semesters)
+• Eligibility: 10+2 with Physics, Chemistry, and Mathematics with minimum 50% marks
+• Overview: The B.Tech in Robotics program provides comprehensive training in robotics engineering, automation, and intelligent systems. Students gain hands-on experience with industrial robots, AI, and machine learning applications in robotics.
+
+Would you like to know more about the curriculum, fees, or placement opportunities?"""
+        
+        # Try to get specific program info
+        program_info = self.get_program_info(original_query)  # Use original query for better matching
+        if program_info:
+            # Get detailed program information
+            program_name = program_info.split('(')[0].strip()
+            program_degree = program_info.split('(')[1].split(',')[0].strip()
+            program_duration = program_info.split('(')[1].split(')')[0].split(',')[1].strip()
+            
+            # Custom descriptions for different program types
+            program_type = program_degree.lower()
+            field = program_name.split('in ')[-1] if 'in ' in program_name else program_name
+            
+            descriptions = {
+                'b.tech': f"The {program_name} program provides a strong foundation in {field} with a focus on practical applications and industry-relevant skills.",
+                'm.tech': f"The {program_name} program offers advanced specialization in {field} with research and development focus.",
+                'mba': f"The {program_name} program develops business acumen and leadership skills in the field of {field}.",
+                'ph.d': f"The {program_name} program is a research-intensive program for scholars in {field}.",
+                'b.des': f"The {program_name} program combines creative design principles with technical skills in {field}.",
+                'm.sc': f"The {program_name} program provides advanced theoretical and practical knowledge in {field}.",
+                'mca': f"The {program_name} program focuses on computer applications and {field} with hands-on training.",
+                'b.sc': f"The {program_name} program offers fundamental knowledge and practical skills in {field}."
+            }
+            
+            description = descriptions.get(program_type.lower(), 
+                f"The {program_name} program provides comprehensive education in {field}.")
+            
+            response = f"""Here's information about {program_name}:
+            
+• Program: {program_name}
+• Degree: {program_degree}
+• Duration: {program_duration}
+• Eligibility: 10+2 with minimum 50% marks (45% for reserved categories)
+• Overview: {description}
+
+Would you like to know more about the curriculum, fees, or placement opportunities?"""
+            return response
+        
+        # If no direct match, find similar programs
+        query_degree = next((d for d in ['b.tech', 'm.tech', 'ph.d', 'b.des', 'mba', 'm.sc', 'mca', 'b.sc'] 
+                           if d in query), None)
+        
+        if query_degree:
+            similar = [p for name, p in self._programs_cache.items() 
+                     if query_degree in name and any(word in name for word in query.split())]
+        else:
+            similar = [p for name, p in self._programs_cache.items() 
+                     if any(word in name for word in query.split() if len(word) > 3)]
+        
+        if similar:
+            return "I couldn't find an exact match, but here are some related programs:\n\n" + "\n".join(f"- {p}" for p in similar[:3]) + "\n\nPlease specify which program you're interested in."
+        
+        return "I couldn't find information about that program. Would you like to see all available programs?"
+
+    def _classify_query_intent(self, user_input: str) -> str:
+        """Classify the intent of the user query with better accuracy."""
+        query = user_input.lower().strip()
+        
+        # First, check for general conversation patterns
+        general_patterns = [
+            r'how (are you|do you feel|is it going)',
+            r'what(\'s| is) (up|new|happening)',
+            r'^(hi|hello|hey|greetings|good (morning|afternoon|evening))',
+            r'^(bye|goodbye|see you|take care)',
+            r'thank',
+            r'what can you do',
+            r'who are you',
+            r'your name',
+            r'help$'
+        ]
+        
+        if any(re.search(pattern, query) for pattern in general_patterns):
+            return "general"
+            
+        # Check for program/course specific queries
+        program_terms = [
+            "program", "course", "degree", "b.tech", "m.tech", "mba", "phd", 
+            "b.des", "m.sc", "mca", "admission", "fee", "tuition", "cost",
+            "scholarship", "eligibility", "curriculum", "syllabus"
+        ]
+        
+        if any(term in query for term in program_terms):
+            return "program_query"
+            
+        # Check for faculty related queries
+        faculty_terms = ["professor", "faculty", "teacher", "lecturer", "staff"]
+        if any(term in query for term in faculty_terms):
+            return "faculty_query"
+        
+        # Check for university facilities
+        facility_terms = ["campus", "library", "hostel", "lab", "sports", "facility", "infrastructure"]
+        if any(term in query for term in facility_terms):
+            return "facility_query"
         
         # Check for farewells
         farewells = ['bye', 'goodbye', 'see you', 'take care', 'farewell']
-        if any(user_lower == f or user_lower.startswith(f + ' ') for f in farewells):
+        if any(query == f or query.startswith(f + ' ') for f in farewells):
             return "farewell"
         
         # Check for thanks
         thanks = ['thank you', 'thanks', 'appreciate', 'grateful']
-        if any(t in user_lower for t in thanks):
+        if any(t in query for t in thanks):
             return "thanks"
         
-        # Check for university-specific keywords
-        university_keywords = [
-            'program', 'course', 'faculty', 'professor', 'admission', 'fee', 'tuition',
-            'scholarship', 'event', 'announcement', 'degree', 'b.tech', 'mba', 'phd',
-            'department', 'semester', 'exam', 'hostel', 'placement', 'campus'
-        ]
-        if any(keyword in user_lower for keyword in university_keywords):
-            return "university"
-        
-        # Check for "how many", "list all", "what are" - likely university queries
+        # Check for counting/list queries
         counting_phrases = ['how many', 'list all', 'what are all', 'show me all', 'tell me about']
-        if any(phrase in user_lower for phrase in counting_phrases):
+        if any(phrase in query for phrase in counting_phrases):
             return "university"
         
         # Default to general conversation
         return "general"
     
     def _handle_general_conversation(self, user_input: str) -> str:
-        """Handle general conversation using LLM without RAG."""
+        """Handle general conversation using LLM with better context and personality."""
         try:
-            # Use LLM directly for natural conversation
-            prompt = f"""You are a friendly university assistant. Respond naturally to this message.
-Keep your response conversational and helpful. If appropriate, mention that you can help with university information.
-
-User: {user_input}
-
-Assistant:"""
+            # Build conversation context
+            context = "\n".join(
+                f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+                for msg in self.conversation_context[-4:]  # Last 2 exchanges
+            )
             
-            response = self.llm.complete(prompt)
-            return response.text.strip()
+            # Enhanced prompt with personality and context
+            prompt = f"""You are a friendly and helpful university assistant. You are having a conversation with a student or prospective student.
+
+Previous conversation:
+{context if context else "No previous context."}
+
+Current query: {user_input}
+
+Guidelines:
+1. Be warm, professional, and engaging
+2. Keep responses concise but helpful
+3. If appropriate, gently guide the conversation toward university-related topics
+4. If you don't know something, say so and offer to help find the information
+5. For personal questions, respond naturally and professionally
+
+Respond naturally to the user's message:"""
+            
+            # Get response from LLM
+            response = self.llm.complete(prompt).text.strip()
+            
+            # Clean up and format the response
+            response = response.split('\n')[0]  # Take only the first line if multiple lines
+            if not response or len(response) < 2:  # Fallback if response is too short
+                response = "I'm here to help! Could you tell me more about what you're looking for?"
+                
+            return response
             
         except Exception as e:
             print(f"Error in general conversation: {e}")
-            return "I'm here to help! Feel free to ask me about university programs, courses, faculty, or admissions."
+            return "I'm here to help! Feel free to ask me about university programs, courses, or any other questions you might have."
     
     def _is_simple_query(self, query: str) -> tuple:
         """Check query type and return (query_type, entity_type)."""
@@ -978,88 +1612,103 @@ Assistant:"""
             traceback.print_exc()
             return None
     
+    def _extract_preferences(self, query: str, response: str) -> None:
+        """Extract and store user preferences from the conversation."""
+        # Look for program mentions
+        program_keywords = ['program', 'course', 'degree', 'bachelor', 'master', 'phd', 'b.tech', 'b.arch', 'mba']
+        if any(keyword in query.lower() for keyword in program_keywords):
+            # Simple pattern matching for program names
+            import re
+            program_matches = re.findall(r'\b(B\.?Tech|B\.?Arch|MBA|M\.?Tech|PhD|Ph\.D|B\.?Com|BBA|BCA|MCA)\b', 
+                                       query, re.IGNORECASE)
+            for program in program_matches:
+                self.user_preferences['preferred_programs'].add(program.upper())
+        
+        # Update response style preference
+        if 'detailed' in query.lower() and 'explanation' in query.lower():
+            self.user_preferences['preferred_response_style'] = 'detailed'
+        elif 'be brief' in query.lower() or 'be concise' in query.lower():
+            self.user_preferences['preferred_response_style'] = 'concise'
+    
     def interact_with_llm(self, user_input: str) -> str:
-        """Interact with the LLM using smart routing (RAG for university queries, LLM for general chat)."""
+        """Optimized LLM interaction with improved caching and routing."""
         self.total_queries += 1
         
         if not user_input.strip():
             return "Please provide a valid question or query."
         
-        # Classify the query intent
+        # Generate cache keys
+        exact_key = self._get_cache_key(user_input, use_semantic=False)
+        semantic_key = self._get_cache_key(user_input, use_semantic=True)
+        
+        # Check caches (exact match first, then semantic)
+        if cached := self._get_cached_response(exact_key, 'llm') or \
+                      self._get_cached_response(semantic_key, 'llm'):
+            print(f"💾 Cache hit! (LLM cache: {self.llm_cache_hits}/{self.total_queries})")
+            return cached
+        
+        # Handle program queries with optimized path
         intent = self._classify_query_intent(user_input)
+        if intent == "program_query":
+            response = self._handle_program_query(user_input)
+            self._cache_response(exact_key, response, ttl=3600, cache_type='llm')
+            return response
+        
+        # Handle conversation management
+        if user_input.lower() in ['what do you know about me?', 'what do you remember?']:
+            response = self._get_user_context_summary()
+            self._cache_response(exact_key, response, ttl=3600, cache_type='llm')
+            return response
         
         # Route based on intent
         if intent in ["greeting", "farewell", "thanks", "general"]:
-            # Use LLM directly for general conversation
-            return self._handle_general_conversation(user_input)
+            response = self._handle_general_conversation(user_input)
+            self._cache_response(exact_key, response, ttl=1800, cache_type='llm')
+            return response
         
-        # Check for simple queries - handle with direct Qdrant access (INSTANT)
+        # Handle simple queries with direct Qdrant access
         query_type, entity_type = self._is_simple_query(user_input)
         if query_type and entity_type:
             print(f"🚀 Fast path: {query_type} query for {entity_type}")
-            fast_response = self._handle_fast_query(query_type, entity_type, user_input)
-            if fast_response:
-                # Store in conversation context
-                self.conversation_context.append({"query": user_input, "response": fast_response})
-                if len(self.conversation_context) > 5:  # Keep last 5 exchanges
+            if fast_response := self._handle_fast_query(query_type, entity_type, user_input):
+                self.conversation_context.append({
+                    "query": user_input, 
+                    "response": fast_response
+                })
+                if len(self.conversation_context) > 5:
                     self.conversation_context.pop(0)
+                self._cache_response(exact_key, fast_response, ttl=3600, cache_type='llm')
                 return fast_response
         
-        # For university queries, use RAG
-        cache_key = self._get_cache_key(user_input)
-        
-        # Check LLM cache first
-        if cache_key in self.llm_cache:
-            self.llm_cache_hits += 1
-            print(f"💾 Cache hit! (LLM cache: {self.llm_cache_hits}/{self.total_queries})")
-            return self.llm_cache[cache_key]
-        
-        # Check old response cache
-        if cache_key in self.response_cache:
-            self.cache_hits += 1
-            return self.response_cache[cache_key]
-        
+        # Process with RAG
         try:
-            print(f"🤖 Using LLM for complex query...")
+            print("🤖 Using optimized RAG pipeline...")
             
-            # Add conversation context to query if available
-            enhanced_query = user_input
-            if self.conversation_context:
-                last_exchange = self.conversation_context[-1]
-                # If query is short and vague, add context
-                if len(user_input.split()) < 5:
-                    enhanced_query = f"Previous context: {last_exchange['query'][:100]}\nCurrent question: {user_input}"
+            # Enhance query with conversation context
+            enhanced_query = self._enhance_query_with_context(user_input)
             
-            # Use RAG for university-specific questions
-            # TODO: Implement streaming in future for better UX
-            # For now, using standard chat (non-streaming)
+            # Get response from RAG
             response = self._chat_engine.chat(enhanced_query).response
             
-            # Store in LLM cache
-            self.llm_cache[cache_key] = response
-            self.response_cache[cache_key] = response
+            # Cache the response
+            self._cache_response(exact_key, response, ttl=3600, cache_type='llm')
+            self._cache_response(semantic_key, response, ttl=1800, cache_type='llm')
             
-            # Store in conversation context
-            self.conversation_context.append({"query": user_input, "response": response})
-            if len(self.conversation_context) > 5:
-                self.conversation_context.pop(0)
+            # Update conversation context
+            self._update_conversation_context(user_input, response)
+            self._extract_preferences(user_input, response)
             
-            print(f"✓ LLM response cached for future queries")
             return response
             
         except Exception as e:
-            error_msg = str(e)
+            error_msg = str(e).lower()
             print(f"Error in RAG query: {e}")
-            import traceback
-            traceback.print_exc()
             
-            # Provide more specific error messages
-            if "timeout" in error_msg.lower() or "ReadTimeout" in error_msg:
-                return "The request took too long to process. This might be due to a large query. Please try asking a more specific question or wait a moment and try again."
-            elif "connection" in error_msg.lower():
-                return "Unable to connect to the AI model. Please ensure Ollama is running (run 'ollama serve' in a terminal)."
-            else:
-                return "I apologize, but I encountered an error. Please try rephrasing your question or asking something more specific."
+            if "timeout" in error_msg or "readtimeout" in error_msg:
+                return "The request timed out. Please try a more specific query."
+            elif "connection" in error_msg:
+                return "Unable to connect to the AI service. Please try again later."
+            return "I'm having trouble processing your request. Could you please rephrase?"
 
 if __name__ == "__main__":
     try:
